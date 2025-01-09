@@ -36,7 +36,9 @@ export async function streamToBuffer(stream: Readable): Promise<Buffer> {
 
 //             const { VerificationToken } = await sesClient.send(verifyDomainCommand);
 
-//             // console.log("VerificationToken: " + VerificationToken)
+//             console.log("VerificationToken: " + VerificationToken)
+
+//             return VerificationToken
 
 //             console.log(`Domain verification request sent for ${domain}`);
 //         } else {

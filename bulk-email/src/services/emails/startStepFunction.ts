@@ -13,9 +13,13 @@ export const StartStepFunction: Handler = async (event) => {
 
         // Handle API Gateway event
         if ('body' in event) {
+            console.log("Received event body:", event.body); // Log the raw body
+
             const body = JSON.parse(event.body);
 
-            const { bucket, key } = body;
+            bucket = body.bucket;
+
+            key = body.key;
 
             if (!bucket || !key) {
                 throw new Error("Bucket and key information are required.");
