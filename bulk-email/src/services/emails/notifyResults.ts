@@ -11,6 +11,8 @@ const sendNotification = async (message: string) => {
     };
 
     const response = await sns.publish(params).promise();
+
+    return response;
 };
 
 export const NotifyResults: Handler = async (event) => {
@@ -24,7 +26,9 @@ export const NotifyResults: Handler = async (event) => {
 
         const notificationMessage = `Bulk email process completed: ${successCount} emails sent, ${failedCount} failed.`;
 
-        await sendNotification(notificationMessage);
+        const response = await sendNotification(notificationMessage);
+
+        console.log("response: " + JSON.stringify(response))
 
         return { statusCode: 200, body: JSON.stringify({ message: 'Notification sent successfully' }) };
 

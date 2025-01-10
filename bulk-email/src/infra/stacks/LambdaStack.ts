@@ -114,7 +114,7 @@ export class LambdaStack extends Stack {
 
         this.sendEmailLambda.addToRolePolicy(new PolicyStatement({
             actions: ['ses:SendEmail', 'ses:ListIdentities', 'ses:VerifyEmailIdentity', 'ses:VerifyDomainIdentity'],
-            resources: ['*'],
+            resources: [this.emailQueue.queueArn],
         }));
 
         this.sendEmailLambda.addToRolePolicy(new PolicyStatement({
@@ -141,16 +141,26 @@ export class LambdaStack extends Stack {
         // Grant the Lambda permission to publish to the SNS topic
         this.snsTopic.grantPublish(this.notificationLambda);
 
-        this.snsTopic.addSubscription(new EmailSubscription('vikashbollam@gmail.com'))
+        const subscription = new EmailSubscription('vikashbollam+1@gmail.com');
+
+        this.snsTopic.addSubscription(subscription);
 
         this.notificationLambda.addToRolePolicy(
             new PolicyStatement({
                 actions: [
                     'ses:SendEmail',
                     'ses:SendRawEmail',
+                ],
+                resources: [this.emailQueue.queueArn],
+            })
+        );
+
+        this.notificationLambda.addToRolePolicy(
+            new PolicyStatement({
+                actions: [
                     'sns:Publish'
                 ],
-                resources: ['*'],
+                resources: [this.snsTopic.topicArn],
             })
         );
 
