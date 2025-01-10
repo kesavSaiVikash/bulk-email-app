@@ -2,6 +2,13 @@
 !jest.config.js
 *.d.ts
 node_modules
+.vscode/
+outputs.json
+projects.http
+
+# Testing
+.env
+test
 
 # CDK asset staging directory
 .cdk.staging
