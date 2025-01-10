@@ -5,6 +5,7 @@ node_modules
 .vscode/
 outputs.json
 projects.http
+package-lock.json
 
 # Testing
 .env
