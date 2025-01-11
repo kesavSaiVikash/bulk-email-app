@@ -118,7 +118,7 @@ export class LambdaStack extends Stack {
         }));
 
         this.sendEmailLambda.addToRolePolicy(new PolicyStatement({
-            actions: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes'],
+            actions: ['sqs:ReceiveMessage', 'sqs:DeleteMessage','sqs:DeleteMessageBatch', 'sqs:GetQueueAttributes'],
             resources: [this.emailQueue.queueArn],
         }));
 

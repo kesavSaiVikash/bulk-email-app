@@ -1,6 +1,6 @@
 import { Handler } from "aws-lambda";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
-import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from "@aws-sdk/client-sqs";
+import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand, DeleteMessageBatchCommand } from "@aws-sdk/client-sqs";
 
 const sesClient = new SESClient({ region: "ca-central-1" });
 const sqsClient = new SQSClient({ region: "ca-central-1" });
@@ -60,12 +60,15 @@ export const SendEmail: Handler = async () => {
 
             const messages = sqsResponse.Messages;
 
-            if (!messages || messages.length === 0) {
+            if (!messages) {
                 console.log("No messages found. Exiting...");
                 break; // Exit if no messages left in queue
             }
 
             console.log(`Fetched ${messages.length} messages from SQS.`);
+
+            // Array to hold receipt handles for successful messages
+            const successfulMessages: any[] = [];
 
             // Process messages concurrently using Promise.all
             const emailResults = await Promise.allSettled(
@@ -82,14 +85,22 @@ export const SendEmail: Handler = async () => {
 
                     const result = await sendEmailWithRetry(email, firstName);
 
+                    // If email was sent successfully, add receipt handle to the array
+                    if (result.status === "Sent") {
+                        successfulMessages.push({
+                            Id: message.MessageId!,
+                            ReceiptHandle: message.ReceiptHandle!,
+                        });
+                    }
+
                     // Delete message from SQS if email was sent successfully
                     // if (result.status === "Sent") {
-                        await sqsClient.send(
-                            new DeleteMessageCommand({
-                                QueueUrl: SQS_QUEUE_URL,
-                                ReceiptHandle: message.ReceiptHandle!,
-                            })
-                        );
+                    // await sqsClient.send(
+                    //     new DeleteMessageCommand({
+                    //         QueueUrl: SQS_QUEUE_URL,
+                    //         ReceiptHandle: message.ReceiptHandle!,
+                    //     })
+                    // );
                     // }
 
                     // Update success or failure count
@@ -102,6 +113,17 @@ export const SendEmail: Handler = async () => {
                     return result;
                 })
             );
+
+            // Delete the successfully processed messages in batch
+            if (successfulMessages.length > 0) {
+                await sqsClient.send(
+                    new DeleteMessageBatchCommand({
+                        QueueUrl: SQS_QUEUE_URL,
+                        Entries: successfulMessages,
+                    })
+                );
+                console.log(`Deleted ${successfulMessages.length} messages from SQS.`);
+            }
 
             // Log the results for the current batch
             console.log(`Processed ${messages.length} messages. Success: ${successCount}, Failed: ${failedCount}`);
