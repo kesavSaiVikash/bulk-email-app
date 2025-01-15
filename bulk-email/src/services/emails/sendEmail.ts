@@ -1,16 +1,17 @@
 import { Handler } from "aws-lambda";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
-import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand, DeleteMessageBatchCommand } from "@aws-sdk/client-sqs";
+import { SQSClient, ReceiveMessageCommand, DeleteMessageBatchCommand, SendMessageCommand } from "@aws-sdk/client-sqs";
+import { DynamoDBClient, GetItemCommand, PutItemCommand, ReturnValue, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
+import { backoff } from '../Utils';
 
+const dynamoDbClient = new DynamoDBClient({ region: "ca-central-1" });
 const sesClient = new SESClient({ region: "ca-central-1" });
 const sqsClient = new SQSClient({ region: "ca-central-1" });
 
 const sourceEmail = "no-reply@helpmarketing.ca";
 const SQS_QUEUE_URL = process.env.QUEUE_URL!;
 
-const MAX_MESSAGES = 10; // Maximum number of messages to fetch from SQS in one batch
-const VISIBILITY_TIMEOUT = 60; // Timeout duration for visibility of messages while processing
-const RETRY_LIMIT = 1; // Retry limit for failed email sends
+const RETRY_LIMIT = 1;
 
 // Helper function to send email with retries
 const sendEmailWithRetry = async (email: string, firstName: string, retries: number = 0) => {
@@ -41,105 +42,181 @@ const sendEmailWithRetry = async (email: string, firstName: string, retries: num
     }
 };
 
-// Lambda Handler to process messages from SQS and send emails
-export const SendEmail: Handler = async () => {
+const initializeStatsInDynamoDB = async (date: string) => {
+    const params = {
+        TableName: process.env.STATS_TABLE_NAME,
+        Item: {
+            id: { S: date },
+            success: { N: "0" },
+            failure: { N: "0" },
+            version: { N: "0" },
+        },
+        ConditionExpression: "attribute_not_exists(id)",
+    };
+
+    try {
+        await dynamoDbClient.send(new PutItemCommand(params));
+        console.log(`Initialized stats for ${date} in DynamoDB.`);
+    } catch (error) {
+        if (error.name === "ConditionalCheckFailedException") {
+            console.log(`Stats for ${date} already initialized.`);
+        } else {
+            console.error("Error initializing stats in DynamoDB:", error);
+            throw error;
+        }
+    }
+};
+
+
+const MAX_RETRIES = 10; // Limit the number of retries to prevent infinite loops
+
+const fetchStatsFromDynamoDB = async (date: string) => {
+    const params = {
+        TableName: process.env.STATS_TABLE_NAME,
+        Key: {
+            id: { S: date }, // Partition key
+        },
+        ProjectionExpression: "version", // Only fetch the version attribute
+    };
+
+    try {
+        const data = await dynamoDbClient.send(new GetItemCommand(params));
+
+        if (!data.Item) {
+            console.log(`No stats found for ${date}. Initializing...`);
+            await initializeStatsInDynamoDB(date);
+            return 0; // Return initial version
+        }
+
+        return parseInt(data.Item.version.N, 10); // Return the current version as a number
+    } catch (error) {
+        console.error("Error fetching stats from DynamoDB:", error);
+        throw error;
+    }
+};
+
+const updateStatsInDynamoDB = async (
+    date: string,
+    success: number,
+    failure: number,
+    currentVersion: number, // Pass the version here
+    retryCount = 0 // Keep track of retries
+) => {
+    const params = {
+        TableName: process.env.STATS_TABLE_NAME,
+        Key: {
+            id: { S: date }, // Partition key
+        },
+        UpdateExpression:
+            "ADD success :successValue, failure :failureValue SET version = version + :incrementValue",
+
+        ConditionExpression: "attribute_exists(id) AND version = :currentVersion",
+
+        ExpressionAttributeValues: {
+            ":successValue": { N: success.toString() },
+            ":failureValue": { N: failure.toString() },
+            ":incrementValue": { N: "1" },
+            ":currentVersion": { N: currentVersion.toString() },
+        },
+
+        ReturnValues: ReturnValue.ALL_NEW, // Return the updated values
+    };
+
+    try {
+        const data = await dynamoDbClient.send(new UpdateItemCommand(params));
+        console.log("Successfully updated stats with OCC in DynamoDB:", data);
+        return data;
+    } catch (error: any) {
+        if (error.name === "ConditionalCheckFailedException") {
+            console.warn(
+                `Conflict detected. Retry #${retryCount + 1} with the latest version.`
+            );
+
+            if (retryCount < MAX_RETRIES) {
+
+                const delay = backoff(retryCount); // Get the exponential backoff delay with jitter
+                await new Promise((resolve) => setTimeout(resolve, delay));
+
+                // Fetch the latest version
+                const latestVersion = await fetchStatsFromDynamoDB(date);
+
+                // Retry the update with the new version
+                return updateStatsInDynamoDB(
+                    date,
+                    success,
+                    failure,
+                    latestVersion,
+                    retryCount + 1
+                );
+            } else {
+                console.error("Max retries reached. Could not update stats in DynamoDB.");
+                throw error; // Throw the error after max retries
+            }
+        }
+    }
+};
+
+export const SendEmail: Handler = async (event) => {
     let messagesProcessed = 0;
     let successCount = 0;
     let failedCount = 0;
 
     try {
-        while (true) {
-            const sqsResponse = await sqsClient.send(
-                new ReceiveMessageCommand({
-                    QueueUrl: SQS_QUEUE_URL,
-                    MaxNumberOfMessages: MAX_MESSAGES,
-                    WaitTimeSeconds: 10, // Enable long polling to reduce cost
-                    VisibilityTimeout: VISIBILITY_TIMEOUT, // Adjust to Lambda processing time
-                })
-            );
+        const currentDateTime = new Date().toISOString().split(":").slice(0, 2).join(":");
 
-            const messages = sqsResponse.Messages;
+        // Loop through each record in the event (messages in the batch)
+        for (const record of event.Records) {
 
-            if (!messages) {
-                console.log("No messages found. Exiting...");
-                break; // Exit if no messages left in queue
+            await new Promise((resolve) => setTimeout(resolve, 200));
+
+            const { body, messageId, receiptHandle } = record;
+
+            const messageBody = JSON.parse(body);
+
+            const { email, firstName } = messageBody;
+
+            console.log(`Processing message: ${messageId}`);
+
+            if (!email || !firstName) {
+                console.error("Invalid message format:", messageBody);
+                continue; // Skip invalid messages
             }
 
-            console.log(`Fetched ${messages.length} messages from SQS.`);
+            // Send the email with retry logic
+            const result = await sendEmailWithRetry(email, firstName);
 
-            // Array to hold receipt handles for successful messages
-            const successfulMessages: any[] = [];
-
-            // Process messages concurrently using Promise.all
-            const emailResults = await Promise.allSettled(
-                messages.map(async (message) => {
-                    const body = JSON.parse(message.Body || "{}");
-                    const { email, firstName } = body;
-
-                    console.log(email, firstName)
-
-                    if (!email || !firstName) {
-                        console.error("Invalid message format:", body);
-                        throw new Error("Invalid message format.");
-                    }
-
-                    const result = await sendEmailWithRetry(email, firstName);
-
-                    // If email was sent successfully, add receipt handle to the array
-                    if (result.status === "Sent") {
-                        successfulMessages.push({
-                            Id: message.MessageId!,
-                            ReceiptHandle: message.ReceiptHandle!,
-                        });
-                    }
-
-                    // Delete message from SQS if email was sent successfully
-                    // if (result.status === "Sent") {
-                    // await sqsClient.send(
-                    //     new DeleteMessageCommand({
-                    //         QueueUrl: SQS_QUEUE_URL,
-                    //         ReceiptHandle: message.ReceiptHandle!,
-                    //     })
-                    // );
-                    // }
-
-                    // Update success or failure count
-                    if (result.status === "Sent") {
-                        successCount++;
-                    } else {
-                        failedCount++;
-                    }
-
-                    return result;
-                })
-            );
-
-            // Delete the successfully processed messages in batch
-            if (successfulMessages.length > 0) {
+            if (result.status === "Sent") {
+                successCount++;
+                // Delete the message after processing
                 await sqsClient.send(
                     new DeleteMessageBatchCommand({
                         QueueUrl: SQS_QUEUE_URL,
-                        Entries: successfulMessages,
+                        Entries: [{ Id: messageId, ReceiptHandle: receiptHandle }],
                     })
                 );
-                console.log(`Deleted ${successfulMessages.length} messages from SQS.`);
+                console.log(`Successfully deleted message: ${messageId}`);
+            } else {
+                failedCount++;
             }
-
-            // Log the results for the current batch
-            console.log(`Processed ${messages.length} messages. Success: ${successCount}, Failed: ${failedCount}`);
-
-            // Count messages processed in this batch
-            messagesProcessed += messages.length;
+            messagesProcessed++;
         }
+
+        // Fetch the current version
+        const currentVersion = await fetchStatsFromDynamoDB(currentDateTime);
+
+        // Update the stats in DynamoDB
+        await updateStatsInDynamoDB(currentDateTime, successCount, failedCount, currentVersion);
 
         // Return summary of email results
         console.log(`Total Messages Processed: ${messagesProcessed}`);
+
         return {
             statusCode: 200,
             body: JSON.stringify({ message: "Emails processed.", successCount, failedCount }),
         };
     } catch (error) {
         console.error("Error processing emails:", error);
+
         return {
             statusCode: 500,
             body: JSON.stringify({ message: "Error processing emails.", error: error.message }),

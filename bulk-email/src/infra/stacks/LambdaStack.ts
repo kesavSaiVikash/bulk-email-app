@@ -11,20 +11,25 @@ import { EmailSubscription } from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Bucket, EventType, IBucket } from 'aws-cdk-lib/aws-s3';
 import { S3EventSourceV2, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import { Queue, IQueue } from 'aws-cdk-lib/aws-sqs';
-
-
+import { Table } from 'aws-cdk-lib/aws-dynamodb';
 
 export class LambdaStack extends Stack {
     public readonly processFileLambda: NodejsFunction;
     public readonly sendEmailLambda: NodejsFunction;
     public readonly notificationLambda: NodejsFunction;
     public readonly startStepFunctionLambda: NodejsFunction;
+
     public readonly startStepFunctionLambdaIntegration: LambdaIntegration;
+
     public readonly snsTopic: ITopic
+
     public readonly emailQueue: IQueue;
 
     constructor(scope: Construct, id: string, props?: StackProps) {
         super(scope, id, props);
+
+        const statsTableName = Fn.importValue('BulkEmailStatsTableName');
+        const statsTable = Table.fromTableName(this, "BulkEmailStatsTable", statsTableName)
 
         const bucketName = Fn.importValue('BulkEmailS3BucketName');
         const athenaResultsBucketName = Fn.importValue('AthenaQueryResultsBucketName');
@@ -38,7 +43,7 @@ export class LambdaStack extends Stack {
 
         this.emailQueue = new Queue(this, 'EmailQueue', {
             queueName: 'bulk-email-queue',
-            visibilityTimeout: Duration.seconds(300),
+            visibilityTimeout: Duration.seconds(900),
         });
 
         this.emailQueue.addToResourcePolicy(
@@ -60,7 +65,7 @@ export class LambdaStack extends Stack {
                 ATHENA_TABLE: athenaTableName,
                 ATHENA_BUCKET_NAME: athenaResultsBucketName
             },
-            timeout: Duration.minutes(2)
+            timeout: Duration.minutes(15)
         });
 
         // Grant Lambda permission to send messages to SQS
@@ -68,7 +73,6 @@ export class LambdaStack extends Stack {
             actions: ['sqs:SendMessage', 'sqs:SendMessageBatch'],
             resources: [this.emailQueue.queueArn],
         }));
-
 
         // Grant permissions to Lambda to query Athena
         this.processFileLambda.addToRolePolicy(new PolicyStatement({
@@ -108,8 +112,9 @@ export class LambdaStack extends Stack {
             entry: join(__dirname, '..', '..', 'services', 'emails', 'sendEmail.ts'),
             environment: {
                 QUEUE_URL: this.emailQueue.queueUrl,
+                STATS_TABLE_NAME: statsTableName
             },
-            timeout: Duration.minutes(2)
+            timeout: Duration.minutes(15)
         });
 
         this.sendEmailLambda.addToRolePolicy(new PolicyStatement({
@@ -118,11 +123,28 @@ export class LambdaStack extends Stack {
         }));
 
         this.sendEmailLambda.addToRolePolicy(new PolicyStatement({
-            actions: ['sqs:ReceiveMessage', 'sqs:DeleteMessage','sqs:DeleteMessageBatch', 'sqs:GetQueueAttributes'],
+            actions: ['sqs:ReceiveMessage', 'sqs:SendMessage', 'sqs:DeleteMessage', 'sqs:DeleteMessageBatch', 'sqs:GetQueueAttributes'],
             resources: [this.emailQueue.queueArn],
         }));
 
-        // this.sendEmailLambda.addEventSource(new SqsEventSource(this.emailQueue));
+        this.sendEmailLambda.addToRolePolicy(new PolicyStatement({
+            actions: [
+                "dynamodb:PutItem",
+                "dynamodb:Scan",
+                "dynamodb:GetItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem",
+            ],
+            resources: [statsTable.tableArn]
+        }
+        ))
+
+        this.sendEmailLambda.addEventSource(
+            new SqsEventSource(this.emailQueue, {
+                batchSize: 10, // Process 10 messages at a time
+                maxConcurrency: 100,
+            })
+        );
 
         this.snsTopic = new Topic(this, 'EmailNotificationTopic', {
             displayName: 'Email Notification Topic',
@@ -135,7 +157,9 @@ export class LambdaStack extends Stack {
             entry: join(__dirname, '..', '..', 'services', 'emails', 'notifyResults.ts'),
             environment: {
                 SNS_TOPIC_ARN: this.snsTopic.topicArn,
+                STATS_TABLE_NAME: statsTableName
             },
+            timeout: Duration.minutes(15)
         });
 
         // Grant the Lambda permission to publish to the SNS topic
@@ -154,6 +178,19 @@ export class LambdaStack extends Stack {
                 resources: [this.emailQueue.queueArn],
             })
         );
+
+        this.notificationLambda.addToRolePolicy(new PolicyStatement({
+            actions: [
+                "dynamodb:PutItem",
+                "dynamodb:Scan",
+                "dynamodb:GetItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem",
+                "dynamodb:Query"
+            ],
+            resources: [statsTable.tableArn]
+        }
+        ))
 
         this.notificationLambda.addToRolePolicy(
             new PolicyStatement({
